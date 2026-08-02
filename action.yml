@@ -29,13 +29,13 @@ inputs:
 runs:
   using: composite
   steps:
-    - name: 리뷰어 체크아웃
-      uses: actions/checkout@v4
-      with:
-        repository: ${{ github.action_repository }}
-        ref: ${{ github.action_ref }}
-        path: .ai-code-review
-
+    # 리뷰어 코드를 체크아웃하지 않는다.
+    # `uses:` 로 불린 시점에 GitHub 이 이 저장소를 $GITHUB_ACTION_PATH 에 이미 내려놨다.
+    #
+    # ⚠️ composite action 안에서 `github.action_repository` 를 쓰면 안 된다.
+    #    그 값은 "현재 실행 중인 액션"으로 해석돼서, 중첩된 actions/checkout 단계에서는
+    #    actions/checkout 자신을 가리킨다. 실제로 그렇게 만들었다가
+    #    엉뚱한 저장소를 받아와 MODULE_NOT_FOUND 로 죽었다.
     - uses: actions/setup-node@v4
       with:
         node-version: "22"
@@ -49,7 +49,7 @@ runs:
 
     - name: 리뷰 실행
       shell: bash
-      working-directory: .ai-code-review
+      working-directory: ${{ github.action_path }}
       run: |
         node review.mjs "${{ inputs.pr }}" \
           --repo "${{ inputs.repo }}" \
