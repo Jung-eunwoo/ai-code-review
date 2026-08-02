@@ -474,8 +474,12 @@ const range = (f) => (f.line === f.endLine ? `${f.line}` : `${f.line}-${f.endLin
 const tag = (f) =>
   `_${CATEGORY[f.category] ?? "🛠️ Maintainability"}_ | _${SEVERITY[f.severity].emoji} ${SEVERITY[f.severity].label}_`;
 
+/** 우리가 단 인라인 코멘트임을 나중에 알아보기 위한 표식. 봇 계정 이름에 의존하지 않는다 */
+const FINDING_MARKER = "<!-- ai-review-finding -->";
+
 function renderInlineBody(f) {
   return [
+    FINDING_MARKER,
     `\`${range(f)}\`: ${tag(f)}`,
     "",
     `**${f.title}**`,
@@ -603,6 +607,10 @@ function ghPostJson(endpoint, payload) {
 }
 
 function post({ repo, number, meta, summary, inline }) {
+  // 새 리뷰를 올리기 **전에** 정리한다. 순서가 반대면 방금 올린 코멘트가
+  // "이번 리뷰에서 재검출되지 않음" 판정에 섞여 들어간다.
+  reconcileThreads({ repo, number, inline });
+
   // 게시되는 모든 텍스트는 예외 없이 여기를 통과한다.
   // 한 번 공개 저장소에 올라간 비밀값은 삭제해도 이미 늦다.
   ghPostJson(`repos/${repo}/issues/${number}/comments`, {
@@ -638,6 +646,85 @@ function post({ repo, number, meta, summary, inline }) {
     });
     console.log("  ✓ 폴백 코멘트 게시");
   }
+}
+
+// ------------------------------------------------ 해결된 지적 닫기
+
+const THREADS_QUERY = `
+query($owner:String!,$repo:String!,$num:Int!){
+  repository(owner:$owner,name:$repo){
+    pullRequest(number:$num){
+      reviewThreads(first:100){
+        nodes{
+          id isResolved isOutdated
+          comments(first:1){nodes{ databaseId body path }}
+        }}}}}`;
+
+/** 우리가 단 것 중 아직 열려 있는 리뷰 스레드 */
+function fetchOpenThreads(repo, number) {
+  const [owner, name] = repo.split("/");
+  const out = gh(
+    "api", "graphql",
+    "-f", `query=${THREADS_QUERY}`,
+    "-f", `owner=${owner}`, "-f", `repo=${name}`, "-F", `num=${number}`
+  );
+  const nodes = JSON.parse(out).data.repository.pullRequest.reviewThreads.nodes;
+  return nodes
+    .filter((t) => !t.isResolved)
+    .map((t) => ({ ...t, first: t.comments.nodes[0] }))
+    .filter((t) => t.first?.body?.includes(FINDING_MARKER));
+}
+
+/**
+ * 고쳐진 지적을 접는다.
+ *
+ * 판정을 **두 신호가 모두 맞을 때만** 내린다:
+ *  1. GitHub 이 스레드를 outdated 로 표시 = 그 자리 코드가 실제로 바뀌었다
+ *  2. 이번 리뷰가 그 파일에서 아무것도 못 찾았다
+ *
+ * 2번만 쓰면 안 된다 — 모델 출력은 실행마다 흔들려서, 안 고쳤는데 이번에
+ * 언급이 없다는 이유로 닫아버리면 진짜 문제가 조용히 사라진다.
+ * 1번(코드가 바뀌었다)은 모델과 무관한 사실이라 그 흔들림을 상쇄한다.
+ *
+ * ponytail: 파일 단위 판정이라, 같은 파일의 다른 줄을 고쳐도 닫힐 수 있다.
+ *           오탐이 관측되면 finding 제목 유사도까지 보게 좁힌다.
+ */
+export const shouldResolve = (thread, stillFlagged) =>
+  thread.isOutdated === true && !stillFlagged.has(thread.path);
+
+function reconcileThreads({ repo, number, inline }) {
+  let threads;
+  try {
+    threads = fetchOpenThreads(repo, number);
+  } catch (e) {
+    console.error(`  ⚠ 기존 스레드 조회 실패 — 닫기 건너뜀: ${e.message}`);
+    return;
+  }
+  if (!threads.length) return;
+
+  const stillFlagged = new Set(inline.map((f) => f.path));
+  let closed = 0;
+
+  for (const t of threads) {
+    if (!shouldResolve({ isOutdated: t.isOutdated, path: t.first.path }, stillFlagged)) continue;
+    try {
+      // 먼저 답글로 근거를 남긴다 — 조용히 닫히면 왜 닫혔는지 알 수 없다
+      ghPostJson(`repos/${repo}/pulls/${number}/comments/${t.first.databaseId}/replies`, {
+        body:
+          "✅ 해당 위치의 코드가 수정되었고 이번 리뷰에서 재검출되지 않아 해결된 것으로 보고 닫는다.\n\n" +
+          "아직 유효하다면 스레드를 다시 열어라 — 판정은 `코드 변경 + 재검출 없음` 두 신호에만 근거한다.",
+      });
+      gh(
+        "api", "graphql",
+        "-f", "query=mutation($id:ID!){resolveReviewThread(input:{threadId:$id}){thread{isResolved}}}",
+        "-f", `id=${t.id}`
+      );
+      closed += 1;
+    } catch (e) {
+      console.error(`  ⚠ 스레드 닫기 실패 (${t.first.path}): ${e.message}`);
+    }
+  }
+  if (closed) console.log(`  ✓ 해결된 지적 ${closed}건 닫음`);
 }
 
 /** 같은 커밋에 이미 리뷰했으면 건너뛴다. DB 없이 마커 하나로 충분하다 */
@@ -863,12 +950,19 @@ function selfTest() {
   assert.ok(!cleaned.includes("ghp_B"), "diff 의 토큰이 그대로 전송된다");
   assert.match(cleaned, /REDACTED/, "가린 흔적은 남겨야 모델이 지적할 수 있다");
 
+  // 11. 해결 판정은 두 신호가 모두 맞을 때만. 한쪽만으로 닫으면 진짜 문제가 조용히 사라진다
+  const flagged = new Set(["a.yml"]);
+  assert.equal(shouldResolve({ isOutdated: true, path: "b.yml" }, flagged), true, "고쳐졌으면 닫는다");
+  assert.equal(shouldResolve({ isOutdated: true, path: "a.yml" }, flagged), false, "재검출되면 열어둔다");
+  assert.equal(shouldResolve({ isOutdated: false, path: "b.yml" }, flagged), false,
+    "코드가 안 바뀌었으면 닫지 않는다 — 모델이 이번에 언급 안 한 것만으론 근거가 못 된다");
+
   assert.ok(!("GH_TOKEN" in MODEL_ENV()), "분석기가 GitHub 쓰기 토큰을 볼 이유가 없다");
   for (const k of ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "GEMINI_API_KEY"]) {
     assert.ok(!(k in GH_ENV()), `게시기가 ${k} 를 볼 이유가 없다`);
   }
 
-  console.log("✓ self-test 통과 (10/10)");
+  console.log("✓ self-test 통과 (11/11)");
 }
 
 // ---------------------------------------------------------------- 진입점
