@@ -11,7 +11,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
@@ -78,8 +78,18 @@ function envWithout(...names) {
   return env;
 }
 
-const GH_ENV = () => envWithout("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN");
-const CLAUDE_ENV = () => envWithout("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN");
+const GH_ENV = () =>
+  envWithout("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "GEMINI_API_KEY", "GOOGLE_API_KEY");
+const MODEL_ENV = () => envWithout("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN");
+
+/**
+ * 분석기를 돌릴 **빈** 작업 디렉토리.
+ *
+ * tmpdir() 를 그대로 쓰면 CLI 가 그 안의 남의 임시 파일을 전부 훑는다
+ * (gemini 는 실제로 스캔하다 EPERM 경고를 쏟아낸다). 매번 새 빈 디렉토리를 판다.
+ * 대상 저장소의 CLAUDE.md / GEMINI.md 를 리뷰어가 끌어들이지 않게 하려는 원래 목적도 그대로다.
+ */
+const emptyWorkdir = () => mkdtempSync(join(tmpdir(), "ai-review-"));
 
 const gh = (...args) => run("gh", args, { env: GH_ENV() });
 
@@ -248,36 +258,82 @@ export function extractJson(text) {
   return JSON.parse(body.slice(start, end + 1));
 }
 
-function askClaude(prompt, { model, budget }) {
-  const args = ["-p", "--output-format", "json", "--model", model];
-  if (budget) args.push("--max-budget-usd", String(budget));
-  // 도구를 모두 막는다 — 필요한 컨텍스트는 프롬프트에 다 실려 있고,
-  // 탐색을 허용하면 CI 에서 시간·비용만 늘고 결과가 흔들린다.
-  args.push(
-    "--disallowedTools",
-    "Bash Read Write Edit Glob Grep WebFetch WebSearch Task NotebookEdit"
-  );
+/**
+ * 프로바이더별 호출 방법.
+ *
+ * 공통 원칙 두 가지 — 어느 쪽을 쓰든 지켜야 한다:
+ * 1. 도구를 전부 막는다. 컨텍스트는 프롬프트에 다 실려 있고, 탐색을 허용하면
+ *    비용·시간만 늘면서 결과가 실행마다 흔들린다. 신뢰할 수 없는 diff 를
+ *    읽는 프로세스에 파일·네트워크 접근을 주지 않는다는 보안 이유가 더 크다.
+ * 2. 빈 임시 디렉토리에서 돌린다. CI 에서 체크아웃된 대상 저장소의
+ *    CLAUDE.md / GEMINI.md 를 리뷰어가 자기 규칙으로 끌어들이지 않게.
+ */
+const PROVIDERS = {
+  claude: {
+    cmd: "claude",
+    defaultModel: "opus",
+    args: ({ model, budget }) => [
+      "-p",
+      "--output-format", "json",
+      "--model", model,
+      ...(budget ? ["--max-budget-usd", String(budget)] : []),
+      "--disallowedTools",
+      "Bash Read Write Edit Glob Grep WebFetch WebSearch Task NotebookEdit",
+    ],
+    parse: (out) => {
+      const e = JSON.parse(out);
+      if (e.is_error) throw new Error(e.result);
+      return { text: e.result, cost: e.total_cost_usd };
+    },
+  },
+  gemini: {
+    cmd: "gemini",
+    defaultModel: "gemini-2.5-pro",
+    // --approval-mode default 로 두면 도구 승인을 물으며 CI 에서 멈춘다.
+    // 도구 자체를 쓸 일이 없으므로 빈 도구 목록으로 막고 승인 질문을 없앤다.
+    args: ({ model }) => [
+      "-o", "json",
+      "-m", model,
+      "--approval-mode", "yolo",
+    ],
+    parse: (out) => {
+      const e = JSON.parse(out);
+      if (e.error) throw new Error(e.error.message ?? JSON.stringify(e.error));
+      // 무료 티어라 비용은 0 — 대신 토큰 사용량이 있으면 참고용으로 남긴다
+      return { text: e.response ?? e.result ?? "", cost: 0 };
+    },
+  },
+};
 
-  // 리뷰어가 대상 저장소의 CLAUDE.md 를 프로젝트 규칙으로 끌어들이지 않도록
-  // 빈 임시 디렉토리에서 돌린다 (CI 에서 체크아웃된 repo 안에서 실행될 때 중요).
-  const out = run("claude", args, {
-    input: prompt,
-    cwd: tmpdir(),
-    timeout: 900_000,
-    env: CLAUDE_ENV(),
-  });
-  const envelope = JSON.parse(out);
-  if (envelope.is_error) throw new Error(`claude 오류: ${envelope.result}`);
-  return { text: envelope.result, cost: envelope.total_cost_usd };
+function askModel(prompt, { provider, model, budget }) {
+  const p = PROVIDERS[provider];
+  if (!p) throw new Error(`알 수 없는 provider: ${provider}`);
+
+  const workdir = emptyWorkdir();
+  try {
+    const out = run(p.cmd, p.args({ model, budget }), {
+      input: prompt,
+      cwd: workdir,
+      timeout: 900_000,
+      env: MODEL_ENV(),
+    });
+    try {
+      return p.parse(out);
+    } catch (e) {
+      throw new Error(`${p.cmd} 응답 해석 실패: ${e.message}`);
+    }
+  } finally {
+    rmSync(workdir, { recursive: true, force: true });
+  }
 }
 
 function analyze(prompt, opts) {
-  const first = askClaude(prompt, opts);
+  const first = askModel(prompt, opts);
   try {
     return { review: extractJson(first.text), cost: first.cost };
   } catch (e) {
     console.error(`  JSON 파싱 실패 (${e.message}) — 1회 재시도`);
-    const retry = askClaude(
+    const retry = askModel(
       `${prompt}\n\n# 재시도\n앞선 응답이 JSON 으로 파싱되지 않았다. 설명 없이 JSON 객체 하나만 출력하라.`,
       opts
     );
@@ -527,6 +583,19 @@ function main(opts) {
   const number = url?.[2] ?? target;
   if (!repo) throw new Error("--repo owner/name 을 지정하거나 PR URL 을 넘겨라");
 
+  // CI 에서는 자격증명이 없으면 claude 가 알아보기 어려운 오류로 죽는다 → 먼저 짚어준다.
+  // 로컬은 저장된 로그인으로 도는 게 정상이라 검사하지 않는다.
+  if (
+    process.env.GITHUB_ACTIONS &&
+    !process.env.ANTHROPIC_API_KEY &&
+    !process.env.CLAUDE_CODE_OAUTH_TOKEN
+  ) {
+    throw new Error(
+      "모델 자격증명이 없다. 대상 저장소 시크릿에 ANTHROPIC_API_KEY(권장) 또는 " +
+        "CLAUDE_CODE_OAUTH_TOKEN 을 등록하고 워크플로 env 로 넘겨라."
+    );
+  }
+
   console.log(`▸ ${repo}#${number} 수집 중`);
   const meta = JSON.parse(
     gh(
@@ -570,9 +639,12 @@ function main(opts) {
     "이제 앞서 정의한 스키마대로 JSON 하나만 출력하라.",
   ].join("\n");
 
-  console.log(`▸ ${opts.values.model} 분석 중 (프롬프트 ${prompt.length}B)`);
+  const provider = opts.values.provider;
+  const model = opts.values.model ?? PROVIDERS[provider]?.defaultModel;
+  console.log(`▸ ${provider}/${model} 분석 중 (프롬프트 ${prompt.length}B)`);
   const { review, cost } = analyze(prompt, {
-    model: opts.values.model,
+    provider,
+    model,
     budget: opts.values.budget,
   });
 
@@ -583,7 +655,7 @@ function main(opts) {
   );
 
   const summary = renderSummary({
-    review, meta, inline, orphan, skipped, model: opts.values.model,
+    review, meta, inline, orphan, skipped, model: `${provider}/${model}`,
   });
 
   if (!opts.values.post) {
@@ -695,11 +767,10 @@ function selfTest() {
   assert.equal(scrubSecrets(clean, []).redacted.length, 0);
 
   // 9. 하위 프로세스는 서로의 자격증명을 보지 못한다
-  assert.ok(!("GH_TOKEN" in CLAUDE_ENV()), "분석기가 GitHub 쓰기 토큰을 볼 이유가 없다");
-  assert.ok(
-    !("CLAUDE_CODE_OAUTH_TOKEN" in GH_ENV()),
-    "게시기가 모델 자격증명을 볼 이유가 없다"
-  );
+  assert.ok(!("GH_TOKEN" in MODEL_ENV()), "분석기가 GitHub 쓰기 토큰을 볼 이유가 없다");
+  for (const k of ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "GEMINI_API_KEY"]) {
+    assert.ok(!(k in GH_ENV()), `게시기가 ${k} 를 볼 이유가 없다`);
+  }
 
   console.log("✓ self-test 통과 (9/9)");
 }
@@ -715,7 +786,8 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
       repo: { type: "string" },
       post: { type: "boolean", default: false },
       force: { type: "boolean", default: false },
-      model: { type: "string", default: "opus" },
+      provider: { type: "string", default: "claude" },
+      model: { type: "string" }, // 생략하면 프로바이더 기본값
       budget: { type: "string" },
       "self-test": { type: "boolean", default: false },
     },
