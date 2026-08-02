@@ -4,7 +4,7 @@ GitHub PR 에 코드 리뷰를 자동으로 남긴다. CodeRabbit 의 출력 형
 
 의존성이 없다. `gh` CLI 와 Node 22 만 있으면 돈다. `package.json` 도 `node_modules` 도 없다. Octokit 대신 `gh api`, SDK 대신 Node 내장 `fetch`, dotenv 대신 Node 22 내장 `process.loadEnvFile` 을 쓴다. 락파일 관리도, 의존성 취약점 알림도 생기지 않는다.
 
-기본 분석기는 **Gemini** (`gemini-2.5-pro`) 로, [AI Studio](https://aistudio.google.com/apikey) 무료 키로 돈다. `--provider claude` 로 바꿀 수 있다.
+기본 분석기는 **Gemini** (`gemini-flash-latest`) 로, [AI Studio](https://aistudio.google.com/apikey) 무료 키로 돈다. `--provider claude` 로 바꿀 수 있다.
 
 PR 하나에 두 개를 남긴다.
 
@@ -40,7 +40,7 @@ node review.mjs --self-test                              # 파서·가드 검증
 | `--repo owner/name` | PR URL 에서 추출 | 대상 저장소 |
 | `--post` | off | 실제 게시 |
 | `--provider` | `gemini` | `claude` 로 교체 가능 |
-| `--model` | `gemini-2.5-pro` | `gemini-2.5-flash` 가 빠르고 한도가 넉넉하다 |
+| `--model` | `gemini-flash-latest` | `gemini-pro-latest` 가 더 정확하지만 무료 한도를 빨리 쓴다 |
 | `--force` | off | 같은 커밋 중복 리뷰 방지 무시 |
 
 `--model` 을 매번 치기 싫으면 `.env` 에 `GEMINI_MODEL=` 을 넣으면 된다. 우선순위는 `--model` > `.env` > 기본값.
@@ -75,7 +75,9 @@ gh pr view / gh pr diff
 
 루브릭도 여기 들어간다. `critical` 은 실제 사용자 피해가 있을 때만, "좋은 지적 vs 나쁜 지적" 예시로 일반론("에러 처리를 견고하게 하세요")을 걸러낸다. 특히 **도달 불가능한 분기**와 **주석이 선언한 동작과 실제 코드의 불일치**를 우선 찾게 했는데, 실전에서 가장 잘 잡히는 실버그가 이 둘이다.
 
-분석 프로세스는 도구를 전부 차단하고 빈 임시 디렉토리에서 돌린다. 컨텍스트는 프롬프트에 이미 다 실려 있어서 탐색이 필요 없고, 허용하면 CI 에서 시간과 비용만 늘면서 결과가 실행마다 흔들린다. 임시 디렉토리에서 도는 건 CI 에서 체크아웃된 대상 저장소의 `CLAUDE.md` 를 리뷰어가 자기 규칙으로 끌어들이지 않게 하려는 것이다.
+Gemini 쪽은 CLI 를 거치지 않고 REST 를 직접 친다. CLI 는 `GEMINI_API_KEY` 가 있어도 캐시된 OAuth 자격증명을 먼저 잡아서, Workspace 계정이면 `GOOGLE_CLOUD_PROJECT` 를 요구하며 죽는다. 환경에 따라 인증 경로가 갈리는 걸 CI 에서 디버깅할 이유가 없다. REST 는 키 하나로 동작이 확정되고, `responseMimeType: application/json` 으로 구조화 출력을 API 차원에서 강제할 수 있다.
+
+부수 효과로 보안이 단순해진다 — 순수 HTTP 호출이라 모델이 쓸 수 있는 도구가 애초에 존재하지 않는다. 도구 차단 플래그도, 작업 디렉토리 격리도 필요 없다. (`--provider claude` 는 CLI 를 쓰므로 그때만 도구 차단 + 빈 임시 디렉토리가 적용된다.)
 
 ### 3. 조용히 사라지는 것을 만들지 않기
 
@@ -99,17 +101,24 @@ gh pr view / gh pr diff
 
 ### 7. 배포는 composite action
 
-여러 저장소에 붙일 거라, 대상 저장소마다 스크립트를 복사하는 대신 `action.yml` 을 두고 `uses:` 로 끌어쓰게 했다. 대상 저장소에 들어가는 건 워크플로 파일 하나뿐이고, 리뷰어 로직을 고치면 모든 저장소에 한 번에 반영된다. `uses:` 가 체크아웃까지 대신 처리하므로 리뷰어 저장소를 따로 clone 하는 단계도 없다.
+여러 저장소에 붙일 거라, 대상 저장소마다 스크립트를 복사하는 대신 `action.yml` 을 두고 `uses:` 로 끌어쓰게 했다. 대상 저장소에 들어가는 건 워크플로 파일 하나뿐이고, 리뷰어 로직을 고치면 모든 저장소에 한 번에 반영된다.
+
+여기서 한 번 틀렸다. 리뷰어 코드를 가져오려고 `actions/checkout` 에 `repository: ${{ github.action_repository }}` 를 넘겼는데, **composite action 안에서 그 값은 "현재 실행 중인 액션"으로 해석된다.** 중첩된 `actions/checkout` 단계에서는 `actions/checkout` 자기 자신을 가리켜서, 엉뚱한 저장소를 받아오고 `MODULE_NOT_FOUND` 로 죽었다.
+
+애초에 체크아웃이 필요 없었다 — `uses:` 로 불린 시점에 GitHub 이 액션 저장소를 `$GITHUB_ACTION_PATH` 에 이미 내려놓는다. 단계를 통째로 지우고 `working-directory: ${{ github.action_path }}` 로 바꿨다.
+
+소비자는 `@main` 이 아니라 `@v1` 태그에 고정한다. `@main` 은 커밋할 때마다 붙어 있는 모든 저장소의 리뷰어가 즉시 바뀌어서, 사고가 나면 전부 동시에 깨진다.
 
 ---
 
 ## 다른 저장소에 연결하기
 
-**1. 토큰 발급** (한 번만)
+**1. 키 등록** (저장소당 한 번)
+
+[AI Studio](https://aistudio.google.com/apikey) 에서 무료 키를 받아 대상 저장소 시크릿에 넣는다.
 
 ```bash
-claude setup-token
-gh secret set CLAUDE_CODE_OAUTH_TOKEN --repo OWNER/REPO
+gh secret set GEMINI_API_KEY --repo OWNER/REPO
 ```
 
 organization 시크릿으로 등록해두면 저장소를 추가할 때마다 다시 할 필요가 없다.
@@ -119,11 +128,11 @@ organization 시크릿으로 등록해두면 저장소를 추가할 때마다 �
 [`examples/pr-review.yml`](examples/pr-review.yml) 을 대상 저장소의 `.github/workflows/ai-review.yml` 로 그대로 복사한다.
 
 ```yaml
-- uses: Jung-eunwoo/ai-code-review@main
+- uses: Jung-eunwoo/ai-code-review@v1
   with:
     pr: ${{ github.event.number }}
   env:
-    CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+    GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
     GH_TOKEN: ${{ github.token }}
 ```
 
@@ -137,7 +146,7 @@ organization 시크릿으로 등록해두면 저장소를 추가할 때마다 �
 
 한 겹으로 막지 않았다. 프롬프트 지시는 모델이 따를 때만 작동하므로, 모델이 이미 넘어갔다고 가정한 층이 따로 있어야 한다.
 
-**1. 최소 권한 프로세스 분리.** 분석기(`claude`)는 GitHub 쓰기 토큰이 필요 없고, 게시기(`gh`)는 모델 자격증명이 필요 없다. `envWithout` 으로 각 하위 프로세스의 환경변수에서 상대방 자격증명을 지워서 넘긴다. 분석기는 도구도 전부 차단돼 있어 파일을 읽거나 명령을 실행할 수단 자체가 없다.
+**1. 분석기에 도구를 주지 않는다.** 기본 경로(Gemini)는 REST 호출이라 모델이 파일을 읽거나 명령을 실행할 수단이 구조적으로 없다. `--provider claude` 로 CLI 를 쓸 때만 도구 차단 플래그와 빈 임시 디렉토리가 필요해진다. 게시기(`gh`)에는 모델 자격증명을, 분석기에는 GitHub 쓰기 토큰을 넘기지 않는다 (`envWithout`) — 한쪽이 뚫려도 다른 쪽 권한은 손에 안 들어온다.
 
 **2. 신뢰 경계 명시.** 프롬프트 최상단에 diff 안의 모든 문장은 리뷰 대상 데이터이지 지시가 아니라고 못박고, diff 를 "신뢰할 수 없는 입력 시작/끝" 마커로 감싼다. 조종 시도를 발견하면 따르지 말고 `critical`/`security` 지적으로 **보고하게** 했다 — 공격을 탐지 신호로 바꾼다.
 

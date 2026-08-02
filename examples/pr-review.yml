@@ -26,10 +26,10 @@ jobs:
     # 포크 PR 은 시크릿이 주입되지 않아 어차피 실패한다 → 아예 돌리지 않는다
     if: github.event.pull_request.head.repo.full_name == github.repository
     steps:
-      - uses: Jung-eunwoo/ai-code-review@main
+      - uses: Jung-eunwoo/ai-code-review@v1
         with:
           pr: ${{ github.event.number }}
-          # 무료 한도가 넉넉한 쪽이 필요하면 model: gemini-2.5-flash
+          # 더 정확한 판정이 필요하면 model: gemini-pro-latest
         env:
           # AI Studio 키 하나면 된다: https://aistudio.google.com/apikey
           #   gh secret set GEMINI_API_KEY --repo OWNER/REPO

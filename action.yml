@@ -19,7 +19,7 @@ inputs:
     required: false
     default: "gemini"
   model:
-    description: "모델명. 생략하면 프로바이더 기본값 (gemini-2.5-pro / opus)"
+    description: "모델명. 생략하면 프로바이더 기본값 (gemini-flash-latest / opus)"
     required: false
   post:
     description: "false 면 게시하지 않고 로그로만 출력한다 (도입 전 시범 운영용)"
