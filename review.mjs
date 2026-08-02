@@ -244,6 +244,26 @@ export function scrubSecrets(text, secrets = liveSecretValues()) {
   return { text: out, redacted: [...new Set(redacted)], leaked };
 }
 
+/**
+ * 모델로 **나가기 전에** diff 를 씻는다.
+ *
+ * guardOutput 은 게시물만 본다. 그 사이에 diff 원문은 이미 서드파티 모델로
+ * 전송된 뒤다 — 무료 티어는 학습에 쓰이기도 하므로 되돌릴 수 없다.
+ * PR 에 실수로 커밋된 자격증명이 그대로 나가는 걸 여기서 끊는다.
+ *
+ * 값을 지우되 `[REDACTED: ...]` 표시는 남긴다. 그래야 모델이
+ * "이 줄에 자격증명이 하드코딩돼 있다"를 여전히 지적할 수 있다.
+ */
+function guardInput(diff) {
+  const { text, redacted } = scrubSecrets(diff);
+  if (redacted.length) {
+    console.error(
+      `  ⚠ diff 에서 ${redacted.join(", ")} 를 가린 뒤 전송한다 — 커밋에 자격증명이 들어있다`
+    );
+  }
+  return text;
+}
+
 /** 게시 대상 텍스트를 전부 통과시킨다. 확정 유출이면 게시를 중단한다 */
 function guardOutput(label, text) {
   const { text: safe, redacted, leaked } = scrubSecrets(text);
@@ -701,7 +721,7 @@ async function main(opts) {
     "",
     "# Diff",
     "```diff",
-    diff,
+    guardInput(diff),
     "```",
     "",
     "# 신뢰할 수 없는 입력 끝",
@@ -836,12 +856,19 @@ function selfTest() {
   assert.equal(scrubSecrets(clean, []).redacted.length, 0);
 
   // 9. 하위 프로세스는 서로의 자격증명을 보지 못한다
+  // 10. diff 에 커밋된 자격증명은 모델로 나가기 전에 가려진다
+  //     (게시물만 검열하면 이미 서드파티로 전송된 뒤라 되돌릴 수 없다)
+  const dirty = '+  const key = "ghp_' + "B".repeat(36) + '";';
+  const cleaned = scrubSecrets(dirty, []).text;
+  assert.ok(!cleaned.includes("ghp_B"), "diff 의 토큰이 그대로 전송된다");
+  assert.match(cleaned, /REDACTED/, "가린 흔적은 남겨야 모델이 지적할 수 있다");
+
   assert.ok(!("GH_TOKEN" in MODEL_ENV()), "분석기가 GitHub 쓰기 토큰을 볼 이유가 없다");
   for (const k of ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "GEMINI_API_KEY"]) {
     assert.ok(!(k in GH_ENV()), `게시기가 ${k} 를 볼 이유가 없다`);
   }
 
-  console.log("✓ self-test 통과 (9/9)");
+  console.log("✓ self-test 통과 (10/10)");
 }
 
 // ---------------------------------------------------------------- 진입점
