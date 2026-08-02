@@ -1,0 +1,30 @@
+# 리뷰를 붙일 저장소의 .github/workflows/ai-review.yml 로 복사한다.
+# Jung-eunwoo/ai-code-review 부분만 본인 저장소로 바꾸면 끝이다.
+name: AI Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+# GH_TOKEN 이 리뷰를 남기려면 write 가 필요하다
+permissions:
+  contents: read
+  pull-requests: write
+
+# 같은 PR 에 push 가 연달아 오면 이전 리뷰 작업을 취소한다 (중복 리뷰·비용 방지)
+concurrency:
+  group: ai-review-${{ github.event.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    # 포크 PR 은 시크릿이 주입되지 않아 어차피 실패한다 → 아예 돌리지 않는다
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - uses: Jung-eunwoo/ai-code-review@main
+        with:
+          pr: ${{ github.event.number }}
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          GH_TOKEN: ${{ github.token }}

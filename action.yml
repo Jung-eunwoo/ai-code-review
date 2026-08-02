@@ -1,0 +1,56 @@
+name: "AI Code Review"
+description: "PR 에 CodeRabbit 형식의 AI 코드 리뷰를 남긴다 (walkthrough + mermaid + 심각도별 인라인 코멘트)"
+author: "Jung-eunwoo"
+
+branding:
+  icon: "message-square"
+  color: "purple"
+
+inputs:
+  pr:
+    description: "리뷰할 PR 번호"
+    required: true
+  repo:
+    description: "대상 저장소 (owner/name). 기본값은 워크플로가 도는 저장소"
+    required: false
+    default: ${{ github.repository }}
+  model:
+    description: "분석 모델 (opus | sonnet)"
+    required: false
+    default: "opus"
+  budget:
+    description: "PR 1건당 최대 비용(USD). 초과하면 중단한다"
+    required: false
+    default: "2"
+  post:
+    description: "false 면 게시하지 않고 로그로만 출력한다 (도입 전 시범 운영용)"
+    required: false
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    - name: 리뷰어 체크아웃
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ github.action_repository }}
+        ref: ${{ github.action_ref }}
+        path: .ai-code-review
+
+    - uses: actions/setup-node@v4
+      with:
+        node-version: "22"
+
+    - name: claude CLI 설치
+      shell: bash
+      run: npm i -g @anthropic-ai/claude-code
+
+    - name: 리뷰 실행
+      shell: bash
+      working-directory: .ai-code-review
+      run: |
+        node review.mjs "${{ inputs.pr }}" \
+          --repo "${{ inputs.repo }}" \
+          --model "${{ inputs.model }}" \
+          --budget "${{ inputs.budget }}" \
+          ${{ inputs.post == 'true' && '--post' || '' }}
