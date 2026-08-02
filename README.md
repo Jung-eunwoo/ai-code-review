@@ -53,7 +53,7 @@ node review.mjs --self-test                              # 파서·가드 검증
 gh pr view / gh pr diff
   → 생성물 제외 · 크기 상한          trimDiff
   → 코멘트 가능한 줄 수집            collectAnchors
-  → 분석 (도구 차단 · 최소 권한 env)  askClaude
+  → 분석 (REST · 구조화 출력 강제)   askGemini
   → 앵커 대조 · 강등                 splitFindings
   → 비밀정보 검열                    guardOutput
   → walkthrough + 인라인 리뷰 게시    post
