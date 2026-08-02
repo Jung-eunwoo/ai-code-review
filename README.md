@@ -107,7 +107,11 @@ Gemini 쪽은 CLI 를 거치지 않고 REST 를 직접 친다. CLI 는 `GEMINI_A
 
 애초에 체크아웃이 필요 없었다 — `uses:` 로 불린 시점에 GitHub 이 액션 저장소를 `$GITHUB_ACTION_PATH` 에 이미 내려놓는다. 단계를 통째로 지우고 `working-directory: ${{ github.action_path }}` 로 바꿨다.
 
-소비자는 `@main` 이 아니라 `@v1` 태그에 고정한다. `@main` 은 커밋할 때마다 붙어 있는 모든 저장소의 리뷰어가 즉시 바뀌어서, 사고가 나면 전부 동시에 깨진다.
+소비자는 **전체 커밋 SHA** 로 고정한다. `@main` 은 물론이고 `@v1` 같은 태그도 안 된다 — 태그는 force-push 로 옮겨지므로 결국 가변 ref 다.
+
+이 구분을 처음에 놓쳤다. `@v1` 로 고정해두고 배포 절차를 `git tag -f v1 && git push -f` 로 안내했는데, 그러면 붙어 있는 모든 저장소가 **검토 없이** 새 코드를 `GEMINI_API_KEY` 와 `pull-requests: write` 권한으로 실행한다. 리뷰어 저장소가 뚫리면 붙어 있는 저장소가 전부 같이 뚫리는 경로다. 업그레이드는 리뷰어 저장소의 diff 를 보고 SHA 를 손으로 올리는 게 맞다.
+
+(이 지적은 실제로 CodeRabbit 이 `barogagi-front#118` 에서 잡아줬다. 우리 리뷰어는 못 잡아서, 그 뒤 `prompt.md` 에 설정 파일 루브릭을 추가했다.)
 
 ---
 
@@ -128,7 +132,7 @@ organization 시크릿으로 등록해두면 저장소를 추가할 때마다 �
 [`examples/pr-review.yml`](examples/pr-review.yml) 을 대상 저장소의 `.github/workflows/ai-review.yml` 로 그대로 복사한다.
 
 ```yaml
-- uses: Jung-eunwoo/ai-code-review@v1
+- uses: Jung-eunwoo/ai-code-review@01365adee404635cbb79c25b9f6f100ff8b2daff
   with:
     pr: ${{ github.event.number }}
   env:

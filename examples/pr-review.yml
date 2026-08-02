@@ -26,7 +26,11 @@ jobs:
     # 포크 PR 은 시크릿이 주입되지 않아 어차피 실패한다 → 아예 돌리지 않는다
     if: github.event.pull_request.head.repo.full_name == github.repository
     steps:
-      - uses: Jung-eunwoo/ai-code-review@v1
+      # ⚠️ 전체 커밋 SHA 로 고정한다. @main 이나 @v1 같은 이동 가능한 ref 를 쓰면
+      #    업스트림이 바뀌는 순간 검토되지 않은 코드가 이 저장소의 GEMINI_API_KEY 와
+      #    pull-requests: write 권한으로 실행된다.
+      #    올릴 때는 리뷰어 저장소의 diff 를 보고 SHA 를 손으로 바꾼다.
+      - uses: Jung-eunwoo/ai-code-review@01365adee404635cbb79c25b9f6f100ff8b2daff # main 기준
         with:
           pr: ${{ github.event.number }}
           # 더 정확한 판정이 필요하면 model: gemini-pro-latest
