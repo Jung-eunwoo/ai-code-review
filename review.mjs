@@ -11,7 +11,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { readFileSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdtempSync, rmSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
@@ -19,6 +19,19 @@ import { parseArgs } from "node:util";
 import assert from "node:assert/strict";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
+
+/**
+ * .env 로드. Node 22 에 내장된 process.loadEnvFile 을 쓴다 — dotenv 를 붙일 이유가 없다.
+ * 이미 환경에 있는 값(CI 시크릿)이 .env 를 덮어쓰지 않도록, 로드 후 원래 값을 되돌린다.
+ * 파일이 없으면 조용히 넘어간다 — CI 는 .env 없이 시크릿으로만 돈다.
+ */
+function loadDotEnv() {
+  const path = join(HERE, ".env");
+  if (!existsSync(path)) return;
+  const before = { ...process.env };
+  process.loadEnvFile(path);
+  for (const [k, v] of Object.entries(before)) process.env[k] = v;
+}
 
 /** diff 상한. 넘으면 파일 단위로 잘라내고 무엇을 뺐는지 리뷰에 명시한다 */
 const MAX_DIFF_BYTES = 300_000;
@@ -258,86 +271,133 @@ export function extractJson(text) {
   return JSON.parse(body.slice(start, end + 1));
 }
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 /**
- * 프로바이더별 호출 방법.
+ * Gemini REST API 직접 호출.
  *
- * 공통 원칙 두 가지 — 어느 쪽을 쓰든 지켜야 한다:
- * 1. 도구를 전부 막는다. 컨텍스트는 프롬프트에 다 실려 있고, 탐색을 허용하면
- *    비용·시간만 늘면서 결과가 실행마다 흔들린다. 신뢰할 수 없는 diff 를
- *    읽는 프로세스에 파일·네트워크 접근을 주지 않는다는 보안 이유가 더 크다.
- * 2. 빈 임시 디렉토리에서 돌린다. CI 에서 체크아웃된 대상 저장소의
- *    CLAUDE.md / GEMINI.md 를 리뷰어가 자기 규칙으로 끌어들이지 않게.
+ * gemini CLI 를 쓰지 않는 이유: CLI 는 GEMINI_API_KEY 가 있어도 캐시된 OAuth
+ * 자격증명을 먼저 잡는다. Workspace 계정이면 GOOGLE_CLOUD_PROJECT 를 요구하며
+ * 죽는데, 환경에 따라 인증 경로가 갈리는 걸 CI 에서 디버깅할 이유가 없다.
+ * REST 는 키 하나로 동작이 확정된다.
+ *
+ * 부수 효과로 보안도 단순해진다 — 순수 HTTP 호출이라 모델이 쓸 수 있는 도구가
+ * 애초에 존재하지 않는다. 도구 차단 플래그도, 작업 디렉토리 격리도 필요 없다.
  */
-const PROVIDERS = {
-  claude: {
-    cmd: "claude",
-    defaultModel: "opus",
-    args: ({ model, budget }) => [
-      "-p",
-      "--output-format", "json",
-      "--model", model,
-      ...(budget ? ["--max-budget-usd", String(budget)] : []),
-      "--disallowedTools",
-      "Bash Read Write Edit Glob Grep WebFetch WebSearch Task NotebookEdit",
-    ],
-    parse: (out) => {
-      const e = JSON.parse(out);
-      if (e.is_error) throw new Error(e.result);
-      return { text: e.result, cost: e.total_cost_usd };
+async function askGemini(prompt, { model, apiKey }) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+  const body = {
+    contents: [{ parts: [{ text: prompt }] }],
+    generationConfig: {
+      // 구조화 출력을 API 차원에서 강제한다 — 코드펜스·잡담을 파싱할 일이 없어진다
+      responseMimeType: "application/json",
+      temperature: 0.2, // 리뷰는 매번 크게 흔들리면 곤란하다
+      maxOutputTokens: 32768,
     },
-  },
-  gemini: {
-    cmd: "gemini",
-    defaultModel: "gemini-2.5-pro",
-    // --approval-mode default 로 두면 도구 승인을 물으며 CI 에서 멈춘다.
-    // 도구 자체를 쓸 일이 없으므로 빈 도구 목록으로 막고 승인 질문을 없앤다.
-    args: ({ model }) => [
-      "-o", "json",
-      "-m", model,
-      "--approval-mode", "yolo",
-    ],
-    parse: (out) => {
-      const e = JSON.parse(out);
-      if (e.error) throw new Error(e.error.message ?? JSON.stringify(e.error));
-      // 무료 티어라 비용은 0 — 대신 토큰 사용량이 있으면 참고용으로 남긴다
-      return { text: e.response ?? e.result ?? "", cost: 0 };
-    },
-  },
-};
+  };
 
-function askModel(prompt, { provider, model, budget }) {
-  const p = PROVIDERS[provider];
-  if (!p) throw new Error(`알 수 없는 provider: ${provider}`);
+  // 무료 티어는 분당 요청 수 제한이 빡빡하다. 429/503 은 기다렸다 다시 친다.
+  let lastError = "";
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-goog-api-key": apiKey },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(600_000),
+    });
 
+    if (res.status === 429 || res.status === 503) {
+      // 본문을 버리면 "왜 막혔는지"(분당 한도인지, 모델 자체가 막힌 건지)를 잃는다.
+      // 마지막 시도까지 실패했을 때 이 문장이 유일한 단서다.
+      lastError = (await res.text()).replace(/\s+/g, " ").slice(0, 300);
+      const wait = 2 ** attempt * 5_000;
+      console.error(`  ${res.status} — ${wait / 1000}초 후 재시도 (${attempt + 1}/5)`);
+      await sleep(wait);
+      continue;
+    }
+    if (!res.ok) {
+      const detail = await res.text();
+      throw new Error(`Gemini API ${res.status}: ${detail.replace(/\s+/g, " ").slice(0, 400)}`);
+    }
+
+    const data = await res.json();
+    const cand = data.candidates?.[0];
+    if (!cand) {
+      // 안전 필터에 걸리면 candidates 가 통째로 비어 온다
+      throw new Error(`응답에 candidate 가 없다: ${JSON.stringify(data.promptFeedback ?? data).slice(0, 300)}`);
+    }
+    if (cand.finishReason === "MAX_TOKENS") {
+      throw new Error("응답이 토큰 상한에서 잘렸다 — diff 를 줄이거나 maxOutputTokens 를 올려라");
+    }
+
+    const text = (cand.content?.parts ?? []).map((p) => p.text ?? "").join("");
+    const used = data.usageMetadata?.totalTokenCount;
+    return { text, cost: 0, tokens: used };
+  }
+  throw new Error(`Gemini API 재시도 한도 초과 (429/503)\n  마지막 응답: ${lastError}`);
+}
+
+/**
+ * Claude CLI 호출.
+ * 도구를 전부 막고 빈 임시 디렉토리에서 돌린다 — 신뢰할 수 없는 diff 를 읽는
+ * 프로세스에 파일·네트워크 접근을 주지 않고, 대상 저장소의 CLAUDE.md 도 안 끌어온다.
+ */
+function askClaude(prompt, { model, budget }) {
   const workdir = emptyWorkdir();
   try {
-    const out = run(p.cmd, p.args({ model, budget }), {
-      input: prompt,
-      cwd: workdir,
-      timeout: 900_000,
-      env: MODEL_ENV(),
-    });
-    try {
-      return p.parse(out);
-    } catch (e) {
-      throw new Error(`${p.cmd} 응답 해석 실패: ${e.message}`);
-    }
+    const out = run(
+      "claude",
+      [
+        "-p",
+        "--output-format", "json",
+        "--model", model,
+        ...(budget ? ["--max-budget-usd", String(budget)] : []),
+        "--disallowedTools",
+        "Bash Read Write Edit Glob Grep WebFetch WebSearch Task NotebookEdit",
+      ],
+      { input: prompt, cwd: workdir, timeout: 900_000, env: MODEL_ENV() }
+    );
+    const e = JSON.parse(out);
+    if (e.is_error) throw new Error(e.result);
+    return { text: e.result, cost: e.total_cost_usd };
   } finally {
     rmSync(workdir, { recursive: true, force: true });
   }
 }
 
-function analyze(prompt, opts) {
-  const first = askModel(prompt, opts);
+const PROVIDERS = {
+  gemini: {
+    // ⚠️ gemini-2.5-pro / gemini-2.5-flash 로 두지 마라 — 신규 발급 키에는
+    //    "no longer available to new users" 404 가 돌아온다. -latest 별칭만 열려 있다.
+    defaultModel: "gemini-flash-latest",
+    envKeys: ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+    call: (prompt, o) => askGemini(prompt, o),
+  },
+  claude: {
+    defaultModel: "opus",
+    envKeys: ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"],
+    call: async (prompt, o) => askClaude(prompt, o),
+  },
+};
+
+async function analyze(prompt, opts) {
+  const p = PROVIDERS[opts.provider];
+  if (!p) throw new Error(`알 수 없는 provider: ${opts.provider}`);
+
+  const first = await p.call(prompt, opts);
   try {
-    return { review: extractJson(first.text), cost: first.cost };
+    return { review: extractJson(first.text), tokens: first.tokens, cost: first.cost };
   } catch (e) {
     console.error(`  JSON 파싱 실패 (${e.message}) — 1회 재시도`);
-    const retry = askModel(
+    const retry = await p.call(
       `${prompt}\n\n# 재시도\n앞선 응답이 JSON 으로 파싱되지 않았다. 설명 없이 JSON 객체 하나만 출력하라.`,
       opts
     );
-    return { review: extractJson(retry.text), cost: (first.cost ?? 0) + (retry.cost ?? 0) };
+    return {
+      review: extractJson(retry.text),
+      tokens: retry.tokens,
+      cost: (first.cost ?? 0) + (retry.cost ?? 0),
+    };
   }
 }
 
@@ -574,7 +634,7 @@ function alreadyReviewed(repo, number, sha) {
 
 // ---------------------------------------------------------------- 메인
 
-function main(opts) {
+async function main(opts) {
   const target = opts.positionals[0];
   if (!target) throw new Error("PR URL 또는 번호가 필요하다");
 
@@ -583,17 +643,27 @@ function main(opts) {
   const number = url?.[2] ?? target;
   if (!repo) throw new Error("--repo owner/name 을 지정하거나 PR URL 을 넘겨라");
 
-  // CI 에서는 자격증명이 없으면 claude 가 알아보기 어려운 오류로 죽는다 → 먼저 짚어준다.
-  // 로컬은 저장된 로그인으로 도는 게 정상이라 검사하지 않는다.
-  if (
-    process.env.GITHUB_ACTIONS &&
-    !process.env.ANTHROPIC_API_KEY &&
-    !process.env.CLAUDE_CODE_OAUTH_TOKEN
-  ) {
+  const provider = opts.values.provider;
+  const spec = PROVIDERS[provider];
+  if (!spec) {
+    throw new Error(`알 수 없는 provider: ${provider} (가능: ${Object.keys(PROVIDERS).join(", ")})`);
+  }
+  // 우선순위: --model > .env 의 <PROVIDER>_MODEL > 프로바이더 기본값
+  const model =
+    opts.values.model ?? process.env[`${provider.toUpperCase()}_MODEL`] ?? spec.defaultModel;
+
+  // 자격증명은 여기서 한 번에 확인한다. 없이 진행하면 한참 뒤 알아보기 어려운
+  // 오류로 죽으므로, PR 을 긁기도 전에 무엇을 어디에 넣어야 하는지 알려준다.
+  const apiKey = spec.envKeys.map((k) => process.env[k]).find(Boolean);
+  if (!apiKey && provider === "gemini") {
     throw new Error(
-      "모델 자격증명이 없다. 대상 저장소 시크릿에 ANTHROPIC_API_KEY(권장) 또는 " +
-        "CLAUDE_CODE_OAUTH_TOKEN 을 등록하고 워크플로 env 로 넘겨라."
+      `${spec.envKeys[0]} 가 없다.\n` +
+        `  로컬: ${join(HERE, ".env")} 에 ${spec.envKeys[0]}=... 를 넣어라 (.env.example 참고)\n` +
+        `  CI  : 저장소 시크릿에 등록하고 워크플로 env 로 넘겨라`
     );
+  }
+  if (!apiKey && process.env.GITHUB_ACTIONS) {
+    throw new Error(`CI 에서 ${spec.envKeys.join(" 또는 ")} 중 하나가 필요하다.`);
   }
 
   console.log(`▸ ${repo}#${number} 수집 중`);
@@ -639,19 +709,18 @@ function main(opts) {
     "이제 앞서 정의한 스키마대로 JSON 하나만 출력하라.",
   ].join("\n");
 
-  const provider = opts.values.provider;
-  const model = opts.values.model ?? PROVIDERS[provider]?.defaultModel;
   console.log(`▸ ${provider}/${model} 분석 중 (프롬프트 ${prompt.length}B)`);
-  const { review, cost } = analyze(prompt, {
+  const { review, cost, tokens } = await analyze(prompt, {
     provider,
     model,
+    apiKey,
     budget: opts.values.budget,
   });
 
   const { inline, orphan } = splitFindings(review.findings, anchors);
   console.log(
     `  지적 ${(review.findings ?? []).length}건 → 인라인 ${inline.length} / 강등 ${orphan.length}` +
-      (cost ? ` · $${cost.toFixed(4)}` : "")
+      (cost ? ` · $${cost.toFixed(4)}` : tokens ? ` · ${tokens.toLocaleString()} 토큰` : "")
   );
 
   const summary = renderSummary({
@@ -786,7 +855,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
       repo: { type: "string" },
       post: { type: "boolean", default: false },
       force: { type: "boolean", default: false },
-      provider: { type: "string", default: "claude" },
+      provider: { type: "string", default: "gemini" },
       model: { type: "string" }, // 생략하면 프로바이더 기본값
       budget: { type: "string" },
       "self-test": { type: "boolean", default: false },
@@ -795,7 +864,10 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
 
   try {
     if (opts.values["self-test"]) selfTest();
-    else main(opts);
+    else {
+      loadDotEnv();
+      await main(opts);
+    }
   } catch (e) {
     console.error(`✗ ${e.message}`);
     process.exit(1);

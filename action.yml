@@ -14,14 +14,13 @@ inputs:
     description: "대상 저장소 (owner/name). 기본값은 워크플로가 도는 저장소"
     required: false
     default: ${{ github.repository }}
+  provider:
+    description: "분석 프로바이더 (gemini | claude)"
+    required: false
+    default: "gemini"
   model:
-    description: "분석 모델 (opus | sonnet)"
+    description: "모델명. 생략하면 프로바이더 기본값 (gemini-2.5-pro / opus)"
     required: false
-    default: "opus"
-  budget:
-    description: "PR 1건당 최대 비용(USD). 초과하면 중단한다"
-    required: false
-    default: "2"
   post:
     description: "false 면 게시하지 않고 로그로만 출력한다 (도입 전 시범 운영용)"
     required: false
@@ -41,7 +40,10 @@ runs:
       with:
         node-version: "22"
 
+    # gemini 는 REST 직접 호출이라 설치할 게 없다.
+    # claude 를 쓸 때만 CLI 를 깐다.
     - name: claude CLI 설치
+      if: inputs.provider == 'claude'
       shell: bash
       run: npm i -g @anthropic-ai/claude-code
 
@@ -51,6 +53,6 @@ runs:
       run: |
         node review.mjs "${{ inputs.pr }}" \
           --repo "${{ inputs.repo }}" \
-          --model "${{ inputs.model }}" \
-          --budget "${{ inputs.budget }}" \
+          --provider "${{ inputs.provider }}" \
+          ${{ inputs.model && format('--model "{0}"', inputs.model) || '' }} \
           ${{ inputs.post == 'true' && '--post' || '' }}

@@ -2,7 +2,9 @@
 
 GitHub PR 에 코드 리뷰를 자동으로 남긴다. CodeRabbit 의 출력 형식(walkthrough + 흐름도 + 심각도별 인라인 코멘트)을 그대로 따라간다.
 
-의존성이 없다. `gh` CLI, `claude` CLI, Node 22 만 있으면 돈다. `package.json` 도 `node_modules` 도 없다 — 필요한 게 전부 이미 깔려 있는 도구로 되기 때문이다. Octokit 대신 `gh api`, Anthropic SDK 대신 `claude -p` 를 쓴다. 덕분에 CI 에서도 설치 단계가 한 줄이고, 락파일 관리나 의존성 취약점 알림이 아예 생기지 않는다.
+의존성이 없다. `gh` CLI 와 Node 22 만 있으면 돈다. `package.json` 도 `node_modules` 도 없다. Octokit 대신 `gh api`, SDK 대신 Node 내장 `fetch`, dotenv 대신 Node 22 내장 `process.loadEnvFile` 을 쓴다. 락파일 관리도, 의존성 취약점 알림도 생기지 않는다.
+
+기본 분석기는 **Gemini** (`gemini-2.5-pro`) 로, [AI Studio](https://aistudio.google.com/apikey) 무료 키로 돈다. `--provider claude` 로 바꿀 수 있다.
 
 PR 하나에 두 개를 남긴다.
 
@@ -21,10 +23,15 @@ PR 하나에 두 개를 남긴다.
 ## 쓰는 법
 
 ```bash
+cp .env.example .env      # GEMINI_API_KEY 를 채운다
+gh auth login             # repo scope
+
 node review.mjs https://github.com/OWNER/REPO/pull/115   # 확인만 (파일로만 출력)
 node review.mjs 115 --repo OWNER/REPO --post             # 실제 게시
 node review.mjs --self-test                              # 파서·가드 검증
 ```
+
+키는 `.env` 에만 둔다. `.gitignore` 가 `.env` 를 막고 `.env.example` 만 통과시킨다 — 커밋에 실려 나가는 사고를 파일 이름 규칙으로 막는 게 가장 확실하다. CI 는 `.env` 없이 저장소 시크릿으로만 돈다. 환경에 이미 있는 값이 `.env` 를 이기므로, 로컬 파일이 CI 시크릿을 덮어쓸 일은 없다.
 
 `--post` 를 안 붙이면 항상 dry-run 이다. `review-<번호>.md` 와 `.json` 만 로컬에 쓰고 아무것도 게시하지 않는다. 공개 저장소에 잘못 올라간 코멘트는 지워도 알림이 이미 나간 뒤라, 되돌리기 어려운 쪽을 기본값으로 두지 않았다.
 
@@ -32,11 +39,11 @@ node review.mjs --self-test                              # 파서·가드 검증
 | --- | --- | --- |
 | `--repo owner/name` | PR URL 에서 추출 | 대상 저장소 |
 | `--post` | off | 실제 게시 |
-| `--model` | `opus` | `sonnet` 이 싸고 빠르다 |
-| `--budget 2` | 무제한 | PR 1건당 최대 USD |
+| `--provider` | `gemini` | `claude` 로 교체 가능 |
+| `--model` | `gemini-2.5-pro` | `gemini-2.5-flash` 가 빠르고 한도가 넉넉하다 |
 | `--force` | off | 같은 커밋 중복 리뷰 방지 무시 |
 
-사전 조건은 `gh auth login`(`repo` scope) 과 `claude` 로그인.
+`--model` 을 매번 치기 싫으면 `.env` 에 `GEMINI_MODEL=` 을 넣으면 된다. 우선순위는 `--model` > `.env` > 기본값.
 
 ---
 
