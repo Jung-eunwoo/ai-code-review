@@ -25,6 +25,9 @@ inputs:
     description: "false 면 게시하지 않고 로그로만 출력한다 (도입 전 시범 운영용)"
     required: false
     default: "true"
+  reply-to:
+    description: "리뷰 코멘트 ID. 지정하면 리뷰 대신 그 코멘트의 답글을 읽고 대화한다"
+    required: false
 
 runs:
   using: composite
@@ -55,4 +58,5 @@ runs:
           --repo "${{ inputs.repo }}" \
           --provider "${{ inputs.provider }}" \
           ${{ inputs.model && format('--model "{0}"', inputs.model) || '' }} \
+          ${{ inputs['reply-to'] && format('--reply-to "{0}"', inputs['reply-to']) || '' }} \
           ${{ inputs.post == 'true' && '--post' || '' }}
