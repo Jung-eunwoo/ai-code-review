@@ -2,6 +2,10 @@
 # Jung-eunwoo/ai-code-review 부분만 본인 저장소로 바꾸면 끝이다.
 name: AI Code Review
 
+# ⛔ pull_request_target 으로 바꾸지 마라.
+#    그 트리거는 시크릿과 쓰기 토큰이 주입된 상태로 **PR 브랜치 코드**를 돌린다.
+#    포크에서 리뷰가 안 돈다는 이유로 여기를 바꾸는 순간, 아무나 PR 하나로
+#    이 저장소의 시크릿을 가져갈 수 있게 된다.
 on:
   pull_request:
     types: [opened, synchronize, reopened]
