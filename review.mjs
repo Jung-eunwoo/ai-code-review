@@ -487,9 +487,21 @@ const tag = (f) =>
 /** 우리가 단 인라인 코멘트임을 나중에 알아보기 위한 표식. 봇 계정 이름에 의존하지 않는다 */
 const FINDING_MARKER = "<!-- ai-review-finding -->";
 
+/**
+ * 지적의 신원. 다음 실행이 "이건 이미 달아둔 지적이다"를 알아보는 데 쓴다.
+ *
+ * 줄번호는 넣지 않는다 — 뒤에 커밋이 쌓이면 같은 코드도 줄이 밀려서
+ * 매번 다른 신원이 되고 중복 제거가 통째로 무력해진다.
+ */
+const FINDING_KEY_MARKER = "<!-- ai-review-key:";
+
+export const findingKey = (path, title) =>
+  `${path} ${String(title ?? "").trim().toLowerCase().replace(/\s+/g, " ")}`;
+
 function renderInlineBody(f) {
   return [
     FINDING_MARKER,
+    `${FINDING_KEY_MARKER}${encodeMarker(findingKey(f.path, f.title))} -->`,
     `\`${range(f)}\`: ${tag(f)}`,
     "",
     `**${f.title}**`,
@@ -510,13 +522,15 @@ function renderInlineBody(f) {
   ].join("\n");
 }
 
-function renderSummary({ review, meta, inline, orphan, skipped, model }) {
+function renderSummary({ review, meta, inline, orphan, postable, duplicate = [], skipped, model }) {
   const all = [...inline, ...orphan];
   const counts = Object.keys(SEVERITY).map((k) => ({
     key: k,
     n: all.filter((f) => f.severity === k).length,
   }));
-  const posted = inline.filter((f) => f.severity !== "nit");
+  // "posted" 는 이번 실행이 실제로 새로 단 개수다. 이미 열려 있어 다시 달지 않은
+  // 것까지 세면 스레드는 늘지 않았는데 숫자만 오르는 거짓말이 된다.
+  const posted = (postable ?? inline).filter((f) => f.severity !== "nit");
   const nits = inline.filter((f) => f.severity === "nit");
 
   const out = [];
@@ -534,6 +548,21 @@ function renderSummary({ review, meta, inline, orphan, skipped, model }) {
       .map((c) => `${SEVERITY[c.key].emoji} ${SEVERITY[c.key].label} ${c.n}`)
       .join(" · ") || "지적 사항 없음"
   );
+
+  if (duplicate.length) {
+    out.push(
+      "",
+      `<details>`,
+      `<summary>↩️ 이미 열려 있어 다시 달지 않은 지적 (${duplicate.length})</summary>`,
+      "",
+      "아래는 앞선 리뷰에서 이미 지적했고 아직 해결되지 않은 것이다. 기존 스레드가 그대로 열려 있으므로 거기서 이어서 보면 된다.",
+      ""
+    );
+    for (const f of duplicate) {
+      out.push(`- ${SEVERITY[f.severity].emoji} \`${f.path}\` — **${f.title}**`);
+    }
+    out.push("", "</details>");
+  }
 
   out.push("", "### Walkthrough", "", review.walkthrough ?? "");
 
@@ -606,7 +635,7 @@ function renderSummary({ review, meta, inline, orphan, skipped, model }) {
   out.push(`<!-- ai-review:${meta.headRefOid} -->`);
   // 다음 실행이 walkthrough·표·다이어그램을 다시 만들지 않도록 여기에 넣어둔다.
   // 상태를 둘 곳이 이미 있는데(코멘트 본문) DB 를 만들 이유가 없다.
-  out.push(`${CONTEXT_MARKER}${JSON.stringify(pickContext(review))} -->`);
+  out.push(`${CONTEXT_MARKER}${encodeMarker(JSON.stringify(pickContext(review)))} -->`);
   return out.join("\n");
 }
 
@@ -620,18 +649,52 @@ const pickContext = (r) => ({
 
 const CONTEXT_MARKER = "<!-- ai-review-data:";
 
-/** 이전 실행이 남긴 walkthrough·표·다이어그램을 꺼낸다 */
-export function extractContext(body = "") {
-  const i = body.indexOf(CONTEXT_MARKER);
+/**
+ * 마커에 실을 값을 base64 로 감싼다.
+ *
+ * 평문으로 넣으면 안에 든 `-->` 가 HTML 주석을 그 자리에서 닫아버린다.
+ * mermaid 는 화살표가 문법이라(`A --> B`, `A -->> B`) 다이어그램이 하나라도
+ * 있으면 거의 항상 걸린다. 그러면 남은 JSON 이 코멘트에 그대로 노출되고,
+ * readMarker 도 " -->" 에서 잘라 읽어 파싱에 실패한다 — 컨텍스트가 통째로
+ * 날아가서 다음 실행이 walkthrough 와 다이어그램을 처음부터 다시 만든다.
+ * base64 알파벳에는 `-`, `>`, 공백이 없어 두 문제가 같이 사라진다.
+ */
+const encodeMarker = (value) => Buffer.from(value, "utf8").toString("base64");
+
+const BASE64_ONLY = /^[A-Za-z0-9+/]+={0,2}$/;
+
+/**
+ * 마커 payload 를 꺼낸다.
+ * base64 가 아니면 구버전이 남긴 평문으로 보고 원문을 그대로 돌려준다.
+ */
+function readMarker(body, marker) {
+  const i = body.indexOf(marker);
   if (i === -1) return null;
-  const start = i + CONTEXT_MARKER.length;
+  const start = i + marker.length;
   const end = body.indexOf(" -->", start);
   if (end === -1) return null;
+  const payload = body.slice(start, end).trim();
+  if (!BASE64_ONLY.test(payload)) return payload;
+  return Buffer.from(payload, "base64").toString("utf8");
+}
+
+/** 이전 실행이 남긴 walkthrough·표·다이어그램을 꺼낸다 */
+export function extractContext(body = "") {
+  const payload = readMarker(body, CONTEXT_MARKER);
+  if (payload === null) return null;
   try {
-    return JSON.parse(body.slice(start, end));
+    return JSON.parse(payload);
   } catch {
     return null; // 형식이 깨졌으면 그냥 새로 만든다
   }
+}
+
+/** 인라인 코멘트에서 지적의 신원을 꺼낸다. 없으면(구버전 코멘트) 제목으로 복원한다 */
+export function extractFindingKey(body = "", path = "") {
+  const embedded = readMarker(body, FINDING_KEY_MARKER);
+  if (embedded) return embedded;
+  const title = /\*\*(.+?)\*\*/s.exec(body);
+  return title ? findingKey(path, title[1]) : null;
 }
 
 /** 이 PR 에 우리가 이미 남긴 walkthrough 코멘트 */
@@ -653,10 +716,12 @@ function ghPostJson(endpoint, payload) {
   });
 }
 
-function post({ repo, number, meta, summary, inline, walkthroughId }) {
+function post({ repo, number, meta, summary, inline, postable, openThreads, walkthroughId }) {
   // 새 리뷰를 올리기 **전에** 정리한다. 순서가 반대면 방금 올린 코멘트가
   // "이번 리뷰에서 재검출되지 않음" 판정에 섞여 들어간다.
-  reconcileThreads({ repo, number, inline });
+  // 닫기 판정에는 중복 제거 전 목록(inline)을 쓴다 — 제거된 것도 여전히 유효한
+  // 지적이므로, 그걸 빼고 판정하면 살아 있는 스레드를 해결됐다고 닫아버린다.
+  reconcileThreads({ repo, number, inline, threads: openThreads });
 
   // 게시되는 모든 텍스트는 예외 없이 여기를 통과한다.
   // 한 번 공개 저장소에 올라간 비밀값은 삭제해도 이미 늦다.
@@ -671,7 +736,7 @@ function post({ repo, number, meta, summary, inline, walkthroughId }) {
     console.log("  ✓ walkthrough 코멘트 게시");
   }
 
-  const comments = inline
+  const comments = postable
     .filter((f) => f.severity !== "nit")
     .map((f) => ({
       path: f.path,
@@ -745,15 +810,48 @@ function fetchOpenThreads(repo, number) {
 export const shouldResolve = (thread, stillFlagged) =>
   thread.isOutdated === true && !stillFlagged.has(thread.path);
 
-function reconcileThreads({ repo, number, inline }) {
-  let threads;
+/**
+ * 열린 스레드 조회. 실패하면 null 을 돌려준다 — 빈 배열과 구분해야 한다.
+ * null 은 "모른다"이고, 모를 때는 중복 제거를 하지 않는다.
+ * 중복 하나를 더 다는 것보다 지적 하나를 통째로 잃는 쪽이 나쁘다.
+ */
+function safeFetchOpenThreads(repo, number) {
   try {
-    threads = fetchOpenThreads(repo, number);
+    return fetchOpenThreads(repo, number);
   } catch (e) {
-    console.error(`  ⚠ 기존 스레드 조회 실패 — 닫기 건너뜀: ${e.message}`);
-    return;
+    console.error(`  ⚠ 기존 스레드 조회 실패 — 닫기·중복 제거 건너뜀: ${e.message}`);
+    return null;
   }
-  if (!threads.length) return;
+}
+
+/**
+ * 이미 열려 있는 스레드와 같은 지적은 다시 달지 않는다.
+ *
+ * 여기가 없으면 push 할 때마다 안 고친 지적이 새 스레드로 계속 쌓인다.
+ * 기존 스레드는 그대로 열려 있으므로 지적이 사라지는 게 아니라, 같은 말을
+ * 반복하지 않을 뿐이다.
+ *
+ * @returns {{ postable: object[], duplicate: object[] }}
+ */
+export function dedupeFindings(inline, openThreads) {
+  if (!openThreads) return { postable: inline, duplicate: [] };
+
+  const known = new Set();
+  for (const t of openThreads) {
+    const key = extractFindingKey(t.first?.body ?? "", t.first?.path ?? "");
+    if (key) known.add(key);
+  }
+
+  const postable = [];
+  const duplicate = [];
+  for (const f of inline) {
+    (known.has(findingKey(f.path, f.title)) ? duplicate : postable).push(f);
+  }
+  return { postable, duplicate };
+}
+
+function reconcileThreads({ repo, number, inline, threads }) {
+  if (!threads || !threads.length) return;
 
   const stillFlagged = new Set(inline.map((f) => f.path));
   let closed = 0;
@@ -1056,8 +1154,16 @@ async function main(opts) {
       (cost ? ` · $${cost.toFixed(4)}` : tokens ? ` · ${tokens.toLocaleString()} 토큰` : "")
   );
 
+  // 열린 스레드는 한 번만 조회해서 닫기 판정과 중복 제거에 함께 쓴다.
+  // dry-run 은 게시하지 않으므로 조회하지 않는다 — 미리보기는 전부 보여준다.
+  const openThreads = opts.values.post ? safeFetchOpenThreads(repo, number) : null;
+  const { postable, duplicate } = dedupeFindings(inline, openThreads);
+  if (duplicate.length) {
+    console.log(`  ↩ 이미 열려 있는 지적 ${duplicate.length}건 — 재게시하지 않는다`);
+  }
+
   const summary = renderSummary({
-    review, meta, inline, orphan, skipped, model: `${provider}/${model}`,
+    review, meta, inline, orphan, postable, duplicate, skipped, model: `${provider}/${model}`,
   });
 
   if (!opts.values.post) {
@@ -1073,7 +1179,10 @@ async function main(opts) {
   }
 
   console.log("▸ 게시 중");
-  post({ repo, number, meta, summary, inline, walkthroughId: existing?.id });
+  post({
+    repo, number, meta, summary, inline, postable, openThreads,
+    walkthroughId: existing?.id,
+  });
 }
 
 // ---------------------------------------------------------------- 셀프 체크
@@ -1201,20 +1310,85 @@ function selfTest() {
   assert.equal(isOurComment(undefined), false, "본문이 없어도 죽지 않아야 한다");
 
   // 13. 재사용 컨텍스트 왕복 — 깨지면 매 push 마다 다이어그램을 다시 만든다
-  const ctx = { walkthrough: "요약", changes: [{ group: "g", files: ["a"], summary: "s" }],
-                diagrams: [{ title: "t", mermaid: "sequenceDiagram\n  A->>B: x" }],
-                effort: { score: 3, label: "Moderate", minutes: 30 } };
-  const embedded = `본문\n${CONTEXT_MARKER}${JSON.stringify(ctx)} -->`;
-  assert.deepEqual(extractContext(embedded), ctx, "심어둔 컨텍스트를 되읽지 못한다");
+  //
+  //     ⚠ mermaid 화살표를 반드시 섞어서 확인한다. 여기가 `A->>B`(공백 없음)만
+  //       보고 있으면 실제로 자주 나오는 `A --> B` / `A -->> B` 를 놓친다.
+  const embed = (c) => `본문\n${CONTEXT_MARKER}${encodeMarker(JSON.stringify(c))} -->`;
+  const mkCtx = (mermaid) => ({
+    walkthrough: "요약",
+    changes: [{ group: "g", files: ["a"], summary: "s" }],
+    diagrams: [{ title: "t", mermaid }],
+    effort: { score: 3, label: "Moderate", minutes: 30 },
+  });
+  for (const mermaid of [
+    "sequenceDiagram\n  A->>B: x",
+    "sequenceDiagram\n  A -->> B: 응답",   // 점선 응답, 공백 있음
+    "flowchart TD\n  A[시작] --> B[끝]",   // 플로우차트
+  ]) {
+    const ctx = mkCtx(mermaid);
+    assert.deepEqual(extractContext(embed(ctx)), ctx, `컨텍스트 왕복 실패: ${mermaid}`);
+  }
   assert.equal(extractContext("마커 없는 본문"), null);
   assert.equal(extractContext(`${CONTEXT_MARKER}{깨진json} -->`), null, "깨진 JSON 은 새로 만들게 null");
+  // 마커 payload 에 `-->` 가 새어나가면 HTML 주석이 거기서 닫혀 본문에 노출된다
+  assert.ok(
+    !embed(mkCtx("flowchart TD\n  A --> B")).slice(CONTEXT_MARKER.length).includes("-->\n"),
+    "마커 안에 `-->` 가 남아 주석이 조기 종료된다"
+  );
+
+  // 13b. 실제로 게시되는 본문에서 되읽히는지까지 확인한다.
+  //      단위 왕복만 보면 renderSummary 쪽에서 인코딩을 빠뜨려도 통과한다.
+  const renderedCtx = mkCtx("flowchart TD\n  A[요청] --> B[응답]");
+  const rendered = renderSummary({
+    review: { ...renderedCtx, findings: [] },
+    meta: { title: "t", additions: 1, deletions: 0, changedFiles: 1,
+            baseRefName: "main", headRefName: "f", headRefOid: "0".repeat(40) },
+    inline: [], orphan: [], postable: [], duplicate: [], skipped: [], model: "m",
+  });
+  assert.deepEqual(extractContext(rendered), renderedCtx, "게시 본문에서 컨텍스트를 되읽지 못한다");
+
+  // 14. 지적 중복 제거 — 없으면 push 마다 같은 지적이 새 스레드로 쌓인다
+  const mkThread = (path, title) => ({
+    first: { path, body: renderInlineBody({ path, title, body: "b", line: 1, endLine: 1, severity: "major", category: "correctness" }) },
+  });
+  const found = [
+    { path: "a.ts", title: "널 체크 누락", severity: "major" },
+    { path: "a.ts", title: "새로 생긴 문제", severity: "major" },
+  ];
+  const deduped = dedupeFindings(found, [mkThread("a.ts", "널 체크 누락")]);
+  assert.deepEqual(deduped.postable.map((f) => f.title), ["새로 생긴 문제"], "새 지적까지 막았다");
+  assert.deepEqual(deduped.duplicate.map((f) => f.title), ["널 체크 누락"], "중복을 또 단다");
+  // 제목 앞뒤 공백·대소문자 차이로 같은 지적을 다른 것으로 보면 안 된다
+  assert.equal(
+    dedupeFindings([{ path: "a.ts", title: "  널 체크   누락 " }], [mkThread("a.ts", "널 체크 누락")])
+      .postable.length,
+    0,
+    "공백·대소문자 차이를 다른 지적으로 오인한다"
+  );
+  // 같은 제목이라도 파일이 다르면 다른 지적이다
+  assert.equal(
+    dedupeFindings([{ path: "b.ts", title: "널 체크 누락" }], [mkThread("a.ts", "널 체크 누락")])
+      .postable.length,
+    1,
+    "다른 파일의 지적까지 막았다"
+  );
+  // 조회 실패(null)면 중복 제거를 하지 않는다 — 지적을 잃는 쪽이 더 나쁘다
+  assert.equal(dedupeFindings(found, null).postable.length, 2, "조회 실패 시 지적을 삼켰다");
+  // 키 마커가 없는 구버전 코멘트도 제목으로 복원해서 알아본다
+  assert.equal(
+    dedupeFindings([{ path: "a.ts", title: "널 체크 누락" }], [
+      { first: { path: "a.ts", body: `${FINDING_MARKER}\n\`1\`: t\n\n**널 체크 누락**\n\n본문` } },
+    ]).postable.length,
+    0,
+    "구버전 코멘트를 못 알아본다"
+  );
 
   assert.ok(!("GH_TOKEN" in MODEL_ENV()), "분석기가 GitHub 쓰기 토큰을 볼 이유가 없다");
   for (const k of ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "GEMINI_API_KEY"]) {
     assert.ok(!(k in GH_ENV()), `게시기가 ${k} 를 볼 이유가 없다`);
   }
 
-  console.log("✓ self-test 통과 (13/13)");
+  console.log("✓ self-test 통과 (14/14)");
 }
 
 // ---------------------------------------------------------------- 진입점
